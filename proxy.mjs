@@ -457,7 +457,7 @@ function forward(req, res, body) {
    * off for this route, so a paid model is not left with a bare 502.
    */
   const attemptLimit = () =>
-    Math.min(4, hedgeMax + (state.emptyRetries > 0 ? 1 : 0));
+    Math.min(6, hedgeMax + (state.emptyRetries > 0 ? 2 : 0));
 
   const finishError = () => {
     if (state.settled) return;
@@ -489,7 +489,7 @@ function forward(req, res, body) {
     state.timer.unref?.();
   };
 
-  const launch = () => {
+  const launch = (immediate = false) => {
     if (state.settled && state.winner) return;
     const attempt = { index: state.attempts.length, aborted: false };
     state.attempts.push(attempt);
@@ -503,9 +503,14 @@ function forward(req, res, body) {
         state.failures.push("empty completion (no output events)");
         state.emptyRetries += 1;
       }
-      if (!state.settled && state.attempts.length >= attemptLimit() && state.active === 0) {
-        finishError();
+      if (state.settled || state.active > 0) return;
+      // A failed attempt frees a slot: refill it immediately instead of leaving
+      // the caller with a 502 while the retry budget is still unspent.
+      if (state.attempts.length < attemptLimit()) {
+        launch(true);
+        return;
       }
+      finishError();
     };
 
     const upstreamReq = https.request(
@@ -555,7 +560,7 @@ function forward(req, res, body) {
     });
     upstreamReq.write(payloadBuffer);
     upstreamReq.end();
-    schedule();
+    if (!immediate) schedule();
   };
 
   launch();
