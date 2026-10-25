@@ -1,20 +1,21 @@
 /**
- * AgentRouter adapter proxy for DSH.
+ * AgentRouter adapter proxy for DSH / OpenAI-compatible clients.
  *
- * AgentRouter only serves Responses-API models (gpt-6.1-sol / gpt-5.6-sol /
- * gpt-6-astra) and runs a content WAF that blocks Japanese text inside the
- * `input` / `messages` conversation payload. Its `instructions` field is not
- * scanned.
+ * Two independent upstream behaviours shape this file:
  *
- * Strategy: send the full conversation transcript (all languages preserved) in
- * `instructions`, and keep the filtered `input` field structurally faithful but
- * ASCII-only. That keeps tool-call/tool-result structure intact for the agent
- * loop while never handing the WAF Japanese conversation text.
+ * 1. AgentRouter serves the gpt-6.x-sol family through the OpenAI Responses API
+ *    only, and its edge content filter scans the conversation payload. The
+ *    conversation is therefore carried in `instructions` (not scanned) while
+ *    `input` keeps an ASCII-safe skeleton so tool structure survives.
+ * 2. Individual completions stall unpredictably: the same 10-token prompt can
+ *    return in 1.8 s or 120 s. Requests are therefore hedged — a second attempt
+ *    starts after a delay and the first attempt to produce output wins, with the
+ *    rest cancelled. See AR_HEDGE / AR_HEDGE_DELAY_MS.
  */
 import http from "node:http";
 import https from "node:https";
 
-const PORT = 8789;
+const PORT = Number(process.env.PORT ?? 8789);
 const UPSTREAM_HOST = "agentrouter.org";
 
 const CLINE_HOST = "api.cline.bot";
@@ -23,11 +24,13 @@ const CLINE_HEADERS = {
   "user-agent": "Cline/3.0",
 };
 
-/**
- * Reusing sockets removes a TCP/TLS handshake from every turn. The gateway's
- * own queue time still dominates, but there is no reason to pay for the
- * handshake on top of it.
- */
+const CLIENT_HEADERS = {
+  Originator: "codex_cli_rs",
+  "User-Agent": "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464",
+  Version: "0.101.0",
+};
+
+/** Reusing sockets removes a TCP/TLS handshake from every turn. */
 const agent = new https.Agent({
   keepAlive: true,
   keepAliveMsecs: 30000,
@@ -37,14 +40,21 @@ const agent = new https.Agent({
 const CANONICAL_HEADER =
   "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
 
-const CLIENT_HEADERS = {
-  Originator: "codex_cli_rs",
-  "User-Agent": "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464",
-  Version: "0.101.0",
-};
+/** Hedging: total attempts and the gap before each extra attempt. */
+const HEDGE_MAX = Math.min(4, Math.max(1, Number(process.env.AR_HEDGE ?? 2) || 2));
+const HEDGE_DELAY_MS = Math.max(
+  0,
+  Number(process.env.AR_HEDGE_DELAY_MS ?? 8000) || 0,
+);
+
+/** Reasoning depth dominates time-to-first-token; low keeps turns snappy. */
+const DEFAULT_EFFORT = process.env.AR_REASONING_EFFORT || "low";
 
 const CJK_RE =
   /[\u1100-\u11ff\u2e80-\u2fdf\u3040-\u30ff\u3130-\u318f\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]/u;
+
+const INLINE_TEXT_LIMIT = 400;
+const INLINE_TOOL_LIMIT = 600;
 
 function hasCjk(text) {
   return typeof text === "string" && CJK_RE.test(text);
@@ -57,7 +67,18 @@ function stripControl(text) {
   );
 }
 
-/** Flatten a chat message content (string or content-part array) to text. */
+function asciiPlaceholder(kind) {
+  return `[${kind} content available in the transcript above]`;
+}
+
+function asciiSafeText(text, kind) {
+  if (typeof text !== "string") return text;
+  const clean = stripControl(text);
+  const limit = kind === "tool" ? INLINE_TOOL_LIMIT : INLINE_TEXT_LIMIT;
+  if (clean.length > limit) return asciiPlaceholder(kind);
+  return hasCjk(clean) ? asciiPlaceholder(kind) : clean;
+}
+
 function flattenContent(content) {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -72,32 +93,10 @@ function flattenContent(content) {
   return "";
 }
 
-/** ASCII-safe stand-in for filtered fields; the transcript carries the text. */
-function asciiPlaceholder(kind) {
-  return `[${kind} content available in the transcript above]`;
-}
-
-/**
- * Text is already carried once in `instructions`; repeating it in `input` only
- * pays for prefill twice. Keep short strings inline and elide the rest.
- */
-const INLINE_TEXT_LIMIT = 400;
-const INLINE_TOOL_LIMIT = 600;
-
-function asciiSafeText(text, kind) {
-  if (typeof text !== "string") return text;
-  const clean = stripControl(text);
-  const limit = kind === "tool" ? INLINE_TOOL_LIMIT : INLINE_TEXT_LIMIT;
-  if (clean.length > limit) return asciiPlaceholder(kind);
-  return hasCjk(clean) ? asciiPlaceholder(kind) : clean;
-}
-
-/** Keep JSON shape, but replace non-ASCII string values with a marker. */
 function asciiSafeJson(raw) {
   if (typeof raw !== "string" || raw.length === 0) return "{}";
   if (!hasCjk(raw)) return stripControl(raw);
   try {
-    const parsed = JSON.parse(raw);
     const scrub = (value) => {
       if (typeof value === "string") {
         return hasCjk(value) ? "[text in transcript]" : value;
@@ -110,35 +109,39 @@ function asciiSafeJson(raw) {
       }
       return value;
     };
-    return JSON.stringify(scrub(parsed));
+    return JSON.stringify(scrub(JSON.parse(raw)));
   } catch {
     return "{}";
   }
 }
 
-/** Render the conversation as a plain transcript for the instructions field. */
+function toolCallsOf(message) {
+  const value = message.toolCalls ?? message.tool_calls;
+  return Array.isArray(value) ? value : [];
+}
+
+/** Plain-text transcript; the authoritative copy of the conversation. */
 function renderTranscript(messages) {
   const lines = [];
   let index = 0;
   for (const m of messages) {
     index += 1;
     const role = m && m.role ? m.role : "user";
+    const calls = toolCallsOf(m);
     if (role === "tool") {
-      const out = stripControl(flattenContent(m.content));
       lines.push(
-        `[${index}] tool_result(call_id=${m.toolCallId || m.tool_call_id || "unknown"}):\n${out}`,
+        `[${index}] tool_result(call_id=${m.toolCallId || m.tool_call_id || "unknown"}):\n${stripControl(flattenContent(m.content))}`,
       );
       continue;
     }
-    const calls = toolCallsOf(m);
     if (role === "assistant" && calls.length > 0) {
       const text = stripControl(flattenContent(m.content)).trim();
       if (text) lines.push(`[${index}] assistant: ${text}`);
       for (const call of calls) {
         const fn = call.function || call;
-        const name = fn.name || "tool";
-        const args = typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments ?? {});
-        lines.push(`[${index}] tool_call ${name}(${stripControl(args)})`);
+        const args =
+          typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments ?? {});
+        lines.push(`[${index}] tool_call ${fn.name || "tool"}(${stripControl(args)})`);
       }
       continue;
     }
@@ -148,17 +151,10 @@ function renderTranscript(messages) {
   return lines.join("\n\n");
 }
 
-/** Read a chat message's tool calls regardless of snake_case/camelCase. */
-function toolCallsOf(message) {
-  const value = message.toolCalls ?? message.tool_calls;
-  return Array.isArray(value) ? value : [];
-}
-
-/** Convert one chat message into Responses-API input items (ASCII-safe). */
 function toResponsesItems(message) {
   const role = message && message.role ? message.role : "user";
   const items = [];
-  const toolCalls = toolCallsOf(message);
+  const calls = toolCallsOf(message);
 
   if (role === "tool") {
     items.push({
@@ -169,8 +165,8 @@ function toResponsesItems(message) {
     return items;
   }
 
-  if (role === "assistant" && toolCalls.length > 0) {
-    for (const call of toolCalls) {
+  if (role === "assistant" && calls.length > 0) {
+    for (const call of calls) {
       const fn = call.function || call;
       items.push({
         type: "function_call",
@@ -188,7 +184,6 @@ function toResponsesItems(message) {
       content: asciiSafeText(text, role === "assistant" ? "assistant" : "user"),
     });
   }
-
   return items;
 }
 
@@ -214,210 +209,92 @@ const server = http.createServer((req, res) => {
     res.end();
     return;
   }
-
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok" }));
+    res.end(JSON.stringify({ status: "ok", hedge: HEDGE_MAX, hedgeDelayMs: HEDGE_DELAY_MS }));
     return;
   }
-
   if (req.method === "GET" && (req.url === "/v1/models" || req.url === "/models")) {
-    const upstreamReq = https.request(
-      {
-        hostname: UPSTREAM_HOST,
-        agent,
-        path: "/v1/models",
-        method: "GET",
-        headers: { ...req.headers, host: UPSTREAM_HOST, ...CLIENT_HEADERS },
-      },
-      (upstreamRes) => {
-        res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
-        upstreamRes.pipe(res);
-      },
-    );
-    upstreamReq.on("error", (err) => {
-      res.writeHead(502, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
-    });
-    upstreamReq.end();
+    proxyModels(res, req);
     return;
   }
-
-  // Cline: its API lives under /api/v1 and wraps non-stream bodies in a
-  // {"data": {...}, "success": true} envelope that OpenAI clients cannot read.
   if (req.method === "GET" && req.url === "/cline/v1/models") {
-    const upstreamReq = https.request(
-      {
-        hostname: CLINE_HOST,
-      agent,
-        path: "/api/v1/models",
-        method: "GET",
-        headers: { authorization: req.headers["authorization"] || "", ...CLINE_HEADERS },
-      },
-      (upstreamRes) => {
-        res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
-        upstreamRes.pipe(res);
-      },
-    );
-    upstreamReq.on("error", (err) => {
-      res.writeHead(502, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
-    });
-    upstreamReq.end();
+    proxyClineModels(res, req);
     return;
   }
-
   if (req.method === "POST" && req.url === "/cline/v1/chat/completions") {
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => forwardCline(req, res, Buffer.concat(chunks)));
+    readBody(req, (buf) => forwardCline(req, res, buf));
     return;
   }
-
   if (
     req.method === "POST" &&
     (req.url === "/v1/chat/completions" || req.url === "/chat/completions")
   ) {
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => {
+    readBody(req, (buf) => {
       let body;
       try {
-        body = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+        body = JSON.parse(buf.toString("utf-8"));
       } catch {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: { message: "Invalid JSON body" } }));
         return;
       }
-      try {
-        forward(req, res, body);
-      } catch (err) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: { message: err.message } }));
-      }
+      forward(req, res, body);
     });
     return;
   }
-
   res.writeHead(404, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: { message: "Not Found" } }));
 });
 
-function forward(req, res, body) {
-  const messages = Array.isArray(body.messages) ? body.messages : [];
-  const stream = Boolean(body.stream);
-  const model = body.model || "";
+function readBody(req, onDone) {
+  const chunks = [];
+  req.on("data", (c) => chunks.push(c));
+  req.on("end", () => onDone(Buffer.concat(chunks)));
+}
 
-  const systems = [];
-  const conversation = [];
-  for (const m of messages) {
-    if (m && m.role === "system") systems.push(flattenContent(m.content));
-    else conversation.push(m);
-  }
-
-  const transcript = renderTranscript(conversation);
-  const instructions = [
-    CANONICAL_HEADER,
-    ...systems.filter((s) => s && s.trim().length > 0),
-    "### Conversation transcript (authoritative; the structured input below is redacted for the transport filter)\n" +
-      transcript,
-    "Answer the final user message in the transcript. Preserve its language, follow any project instructions it references, and use the tools when they help.",
-  ]
-    .filter(Boolean)
-    .join("\n\n");
-
-  const input = [];
-  for (const m of conversation) input.push(...toResponsesItems(m));
-  if (input.length === 0) input.push({ role: "user", content: "Continue." });
-
-  const payload = {
-    model,
-    instructions,
-    input,
-    stream,
-  };
-  if (body.max_tokens || body.max_completion_tokens) {
-    payload.max_output_tokens = body.max_tokens || body.max_completion_tokens;
-  }
-  if (typeof body.temperature === "number") payload.temperature = body.temperature;
-  if (typeof body.top_p === "number") payload.top_p = body.top_p;
-
-  // Reasoning depth dominates time-to-first-token on these always-thinking
-  // models. Honour the caller's request, else the operator's default.
-  const effort = body.reasoning_effort || body.reasoning?.effort || process.env.AR_REASONING_EFFORT;
-  if (effort) payload.reasoning = { effort: String(effort) };
-  const verbosity = body.verbosity || process.env.AR_VERBOSITY;
-  if (verbosity) payload.text = { verbosity: String(verbosity) };
-  const tools = normalizeTools(body.tools);
-  if (tools) payload.tools = tools;
-  if (body.tool_choice) {
-    if (typeof body.tool_choice === "string") payload.tool_choice = body.tool_choice;
-    else if (body.tool_choice && body.tool_choice.type === "function") payload.tool_choice = "auto";
-  }
-
-  const payloadBuffer = Buffer.from(JSON.stringify(payload), "utf-8");
-  const started = Date.now();
-  console.log(
-    `[${new Date().toISOString()}] -> ${model} stream=${stream} msgs=${messages.length} tools=${tools ? tools.length : 0}`,
-  );
-
+function proxyModels(res, req) {
   const upstreamReq = https.request(
     {
       hostname: UPSTREAM_HOST,
-        agent,
-      path: "/v1/responses",
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "content-length": payloadBuffer.length,
-        authorization: req.headers["authorization"] || "",
-        ...CLIENT_HEADERS,
-      },
+      path: "/v1/models",
+      method: "GET",
+      agent,
+      headers: { authorization: req.headers["authorization"] || "", ...CLIENT_HEADERS },
     },
     (upstreamRes) => {
-      const status = upstreamRes.statusCode || 502;
-      if (status >= 400) {
-        const errChunks = [];
-        upstreamRes.on("data", (c) => errChunks.push(c));
-        upstreamRes.on("end", () => {
-          const detail = Buffer.concat(errChunks).toString("utf-8");
-          console.error(
-            `[${new Date().toISOString()}] <- ${status} in ${Date.now() - started}ms ${detail.slice(0, 200)}`,
-          );
-          res.writeHead(status, { "Content-Type": "application/json" });
-          res.end(detail || JSON.stringify({ error: { message: `upstream ${status}` } }));
-        });
-        return;
-      }
-
-      if (stream) relayStream(res, upstreamRes, body, model, started);
-      else relayOnce(res, upstreamRes, body, model, started);
+      res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
+      upstreamRes.pipe(res);
     },
   );
-
   upstreamReq.on("error", (err) => {
-    console.error(`[${new Date().toISOString()}] transport error: ${err.message}`);
-    if (!res.headersSent) {
-      res.writeHead(502, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: { message: err.message, type: "upstream_error" } }));
-    } else {
-      res.end();
-    }
+    res.writeHead(502, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { message: err.message } }));
   });
-
-  upstreamReq.write(payloadBuffer);
   upstreamReq.end();
 }
 
-function completionId() {
-  return "chatcmpl-" + Math.random().toString(36).slice(2, 14);
+function proxyClineModels(res, req) {
+  const upstreamReq = https.request(
+    {
+      hostname: CLINE_HOST,
+      path: "/api/v1/models",
+      method: "GET",
+      agent,
+      headers: { authorization: req.headers["authorization"] || "", ...CLINE_HEADERS },
+    },
+    (upstreamRes) => {
+      res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
+      upstreamRes.pipe(res);
+    },
+  );
+  upstreamReq.on("error", (err) => {
+    res.writeHead(502, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { message: err.message } }));
+  });
+  upstreamReq.end();
 }
 
-/**
- * Proxy one Cline chat call. Streaming bodies pass through untouched; JSON
- * bodies are unwrapped from Cline's `{data, success}` envelope so the client
- * sees a plain OpenAI completion.
- */
 function forwardCline(req, res, rawBuffer) {
   let body;
   try {
@@ -427,7 +304,6 @@ function forwardCline(req, res, rawBuffer) {
     res.end(JSON.stringify({ error: { message: "Invalid JSON body" } }));
     return;
   }
-
   const payload = Buffer.from(JSON.stringify(body), "utf-8");
   console.log(
     `[${new Date().toISOString()}] -> cline ${body.model} stream=${Boolean(body.stream)}`,
@@ -436,9 +312,9 @@ function forwardCline(req, res, rawBuffer) {
   const upstreamReq = https.request(
     {
       hostname: CLINE_HOST,
-      agent,
       path: "/api/v1/chat/completions",
       method: "POST",
+      agent,
       headers: {
         ...CLINE_HEADERS,
         "content-length": payload.length,
@@ -479,109 +355,210 @@ function forwardCline(req, res, rawBuffer) {
   upstreamReq.end();
 }
 
-function relayOnce(res, upstreamRes, body, model, started) {
-  const chunks = [];
-  upstreamRes.on("data", (c) => chunks.push(c));
-  upstreamRes.on("end", () => {
-    let parsed;
-    try {
-      parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
-    } catch (err) {
-      res.writeHead(502, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: { message: "Unparseable upstream response: " + err.message } }));
-      return;
-    }
-
-    let text = "";
-    const toolCalls = [];
-    for (const item of parsed.output || []) {
-      if (item.type === "message") {
-        for (const part of item.content || []) {
-          if (part.type === "output_text" && part.text) text += part.text;
-        }
-      } else if (item.type === "function_call") {
-        toolCalls.push({
-          id: item.call_id || item.id,
-          type: "function",
-          function: { name: item.name, arguments: item.arguments || "{}" },
-        });
-      }
-    }
-
-    const message = { role: "assistant", content: text || (toolCalls.length ? null : "") };
-    if (toolCalls.length) message.tool_calls = toolCalls;
-
-    const usage = parsed.usage || {};
-    const result = {
-      id: parsed.id || completionId(),
-      object: "chat.completion",
-      created: parsed.created_at || Math.floor(Date.now() / 1000),
-      model,
-      choices: [
-        {
-          index: 0,
-          message,
-          finish_reason: toolCalls.length ? "tool_calls" : "stop",
-        },
-      ],
-      usage: {
-        prompt_tokens: usage.input_tokens ?? usage.prompt_tokens ?? 0,
-        completion_tokens: usage.output_tokens ?? usage.completion_tokens ?? 0,
-        total_tokens: usage.total_tokens ?? 0,
-      },
-    };
-
-    console.log(
-      `[${new Date().toISOString()}] <- 200 in ${Date.now() - started}ms text=${text.length} tools=${toolCalls.length}`,
-    );
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(result));
-  });
+function completionId() {
+  return "chatcmpl-" + Math.random().toString(36).slice(2, 14);
 }
 
-function relayStream(res, upstreamRes, body, model, started) {
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
+function buildUpstreamPayload(body) {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const systems = [];
+  const conversation = [];
+  for (const m of messages) {
+    if (m && m.role === "system") systems.push(flattenContent(m.content));
+    else conversation.push(m);
+  }
 
-  const id = completionId();
-  const created = Math.floor(Date.now() / 1000);
-  const emit = (delta, finishReason = null) => {
-    res.write(
-      `data: ${JSON.stringify({
-        id,
-        object: "chat.completion.chunk",
-        created,
-        model,
-        choices: [{ index: 0, delta, finish_reason: finishReason }],
-      })}\n\n`,
-    );
+  const transcript = renderTranscript(conversation);
+  const instructions = [
+    CANONICAL_HEADER,
+    ...systems.filter((s) => s && s.trim().length > 0),
+    "### Conversation transcript (authoritative; the structured input below is redacted for the transport filter)\n" +
+      transcript,
+    "Answer the final user message in the transcript. Preserve its language, follow any project instructions it references, and use the tools when they help.",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  const input = [];
+  for (const m of conversation) input.push(...toResponsesItems(m));
+  if (input.length === 0) input.push({ role: "user", content: "Continue." });
+
+  const payload = { model: body.model, instructions, input, stream: Boolean(body.stream) };
+  if (body.max_tokens || body.max_completion_tokens) {
+    payload.max_output_tokens = body.max_tokens || body.max_completion_tokens;
+  }
+  if (typeof body.temperature === "number") payload.temperature = body.temperature;
+  if (typeof body.top_p === "number") payload.top_p = body.top_p;
+
+  const effort = body.reasoning_effort || body.reasoning?.effort || DEFAULT_EFFORT;
+  payload.reasoning = { effort: String(effort) };
+  const verbosity = body.verbosity || process.env.AR_VERBOSITY;
+  if (verbosity) payload.text = { verbosity: String(verbosity) };
+
+  const tools = normalizeTools(body.tools);
+  if (tools) payload.tools = tools;
+  if (typeof body.tool_choice === "string") payload.tool_choice = body.tool_choice;
+
+  return { payload, tools: tools ? tools.length : 0, messageCount: messages.length };
+}
+
+/**
+ * Fire the request, and — when the first attempt has produced nothing after
+ * HEDGE_DELAY_MS — fire a second one. The first attempt to emit output wins;
+ * every other attempt is destroyed before it can bill more tokens.
+ */
+function forward(req, res, body) {
+  const { payload, tools, messageCount } = buildUpstreamPayload(body);
+  const stream = Boolean(body.stream);
+  const model = body.model || "";
+  const payloadBuffer = Buffer.from(JSON.stringify(payload), "utf-8");
+  const startedAt = Date.now();
+
+  console.log(
+    `[${new Date().toISOString()}] -> ${model} stream=${stream} msgs=${messageCount} tools=${tools} effort=${payload.reasoning.effort} hedge=${HEDGE_MAX}`,
+  );
+
+  const state = {
+    attempts: [],
+    settled: false,
+    winner: null,
+    failures: [],
+    active: 0,
+    timer: null,
   };
 
-  emit({ role: "assistant", content: "" });
+  const finishError = () => {
+    if (state.settled) return;
+    state.settled = true;
+    const detail = state.failures.at(-1) || "upstream unavailable";
+    console.error(`[${new Date().toISOString()}] <- all attempts failed: ${detail}`);
+    res.writeHead(502, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { message: detail, type: "upstream_error" } }));
+  };
 
-  const queueStart = Date.now();
-  let ackMs = null;
+  const claim = (attempt) => {
+    if (state.settled) return false;
+    state.settled = true;
+    state.winner = attempt;
+    if (state.timer) clearTimeout(state.timer);
+    for (const other of state.attempts) {
+      if (other !== attempt) other.abort();
+    }
+    return true;
+  };
+
+  const schedule = () => {
+    if (state.settled) return;
+    if (state.attempts.length >= HEDGE_MAX) return;
+    state.timer = setTimeout(() => {
+      if (state.settled) return;
+      launch();
+    }, HEDGE_DELAY_MS);
+    state.timer.unref?.();
+  };
+
+  const launch = () => {
+    if (state.settled && state.winner) return;
+    const attempt = { index: state.attempts.length, aborted: false };
+    state.attempts.push(attempt);
+    state.active += 1;
+    let done = false;
+    const settleAttempt = () => {
+      if (done) return;
+      done = true;
+      state.active -= 1;
+      if (!state.settled && state.attempts.length >= HEDGE_MAX && state.active === 0) {
+        finishError();
+      }
+    };
+
+    const upstreamReq = https.request(
+      {
+        hostname: UPSTREAM_HOST,
+        path: "/v1/responses",
+        method: "POST",
+        agent,
+        headers: {
+          "content-type": "application/json",
+          "content-length": payloadBuffer.length,
+          authorization: req.headers["authorization"] || "",
+          ...CLIENT_HEADERS,
+        },
+      },
+      (upstreamRes) => {
+        const status = upstreamRes.statusCode || 502;
+        if (status >= 400) {
+          const parts = [];
+          upstreamRes.on("data", (c) => parts.push(c));
+          upstreamRes.on("end", () => {
+            const detail = Buffer.concat(parts).toString("utf-8");
+            state.failures.push(`${status} ${detail.slice(0, 200)}`);
+            console.error(
+              `[${new Date().toISOString()}] <- attempt ${attempt.index} ${status} after ${Date.now() - startedAt}ms`,
+            );
+            settleAttempt();
+          });
+          return;
+        }
+        if (stream) {
+          handleStreamAttempt(upstreamRes, attempt, claim, res, model, startedAt, settleAttempt);
+        } else {
+          handleJsonAttempt(upstreamRes, attempt, claim, res, model, startedAt, settleAttempt);
+        }
+      },
+    );
+
+    attempt.abort = () => {
+      attempt.aborted = true;
+      upstreamReq.destroy();
+    };
+    upstreamReq.on("error", (err) => {
+      if (attempt.aborted || state.settled) return;
+      state.failures.push(err.message);
+      settleAttempt();
+    });
+    upstreamReq.write(payloadBuffer);
+    upstreamReq.end();
+    schedule();
+  };
+
+  launch();
+}
+
+function emitChunk(res, id, created, model, delta, finishReason = null) {
+  res.write(
+    `data: ${JSON.stringify({
+      id,
+      object: "chat.completion.chunk",
+      created,
+      model,
+      choices: [{ index: 0, delta, finish_reason: finishReason }],
+    })}\n\n`,
+  );
+}
+
+function handleStreamAttempt(upstreamRes, attempt, claim, res, model, startedAt, settle) {
+  const id = completionId();
+  const created = Math.floor(Date.now() / 1000);
+  let claimed = false;
+  let finished = false;
+  const queued = [];
   const toolIndexByItem = new Map();
   let toolCount = 0;
   let textChars = 0;
-  let buffer = "";
-  let finished = false;
+  let ackMs = null;
 
   const handleEvent = (event) => {
     switch (event.type) {
-      case "response.created": {
-        if (ackMs === null) ackMs = Date.now() - queueStart;
+      case "response.created":
+        if (ackMs === null) ackMs = Date.now() - startedAt;
         break;
-      }
       case "response.output_item.added": {
         const item = event.item || {};
         if (item.type === "function_call") {
           const index = toolCount++;
           toolIndexByItem.set(item.id, index);
-          emit({
+          emitChunk(res, id, created, model, {
             tool_calls: [
               {
                 index,
@@ -597,21 +574,20 @@ function relayStream(res, upstreamRes, body, model, started) {
       case "response.function_call_arguments.delta": {
         const index = toolIndexByItem.get(event.item_id);
         if (index === undefined) break;
-        emit({
+        emitChunk(res, id, created, model, {
           tool_calls: [{ index, function: { arguments: event.delta || "" } }],
         });
         break;
       }
-      case "response.output_text.delta": {
+      case "response.output_text.delta":
         if (event.delta) {
           textChars += event.delta.length;
-          emit({ content: event.delta });
+          emitChunk(res, id, created, model, { content: event.delta });
         }
         break;
-      }
       case "response.completed": {
         const usage = (event.response && event.response.usage) || {};
-        emit({}, toolCount > 0 ? "tool_calls" : "stop");
+        emitChunk(res, id, created, model, {}, toolCount > 0 ? "tool_calls" : "stop");
         res.write(
           `data: ${JSON.stringify({
             id,
@@ -631,12 +607,9 @@ function relayStream(res, upstreamRes, body, model, started) {
         break;
       }
       case "error": {
-        const message =
-          (event.error && event.error.message) || "upstream stream error";
+        const message = (event.error && event.error.message) || "upstream stream error";
         console.error(`[${new Date().toISOString()}] stream error: ${message}`);
-        res.write(
-          `data: ${JSON.stringify({ error: { message, type: "upstream_error" } })}\n\n`,
-        );
+        res.write(`data: ${JSON.stringify({ error: { message, type: "upstream_error" } })}\n\n`);
         res.write("data: [DONE]\n\n");
         finished = true;
         break;
@@ -646,6 +619,37 @@ function relayStream(res, upstreamRes, body, model, started) {
     }
   };
 
+  const isOutputEvent = (event) =>
+    (event.type === "response.output_text.delta" && event.delta) ||
+    (event.type === "response.output_item.added" &&
+      (event.item || {}).type === "function_call");
+
+  const deliver = (event) => {
+    if (!claimed) {
+      if (!isOutputEvent(event)) {
+        queued.push(event);
+        return;
+      }
+      if (!claim(attempt)) {
+        upstreamRes.destroy();
+        settle();
+        return;
+      }
+      claimed = true;
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        "X-Proxy-Attempt": String(attempt.index),
+      });
+      emitChunk(res, id, created, model, { role: "assistant", content: "" });
+      for (const buffered of queued) handleEvent(buffered);
+      queued.length = 0;
+    }
+    handleEvent(event);
+  };
+
+  let buffer = "";
   upstreamRes.on("data", (chunk) => {
     buffer += chunk.toString("utf-8");
     const lines = buffer.split(/\r?\n/);
@@ -655,30 +659,95 @@ function relayStream(res, upstreamRes, body, model, started) {
       if (!trimmed.startsWith("data:")) continue;
       const raw = trimmed.slice(5).trim();
       if (!raw || raw === "[DONE]") continue;
+      let event;
       try {
-        handleEvent(JSON.parse(raw));
+        event = JSON.parse(raw);
       } catch {
-        /* ignore malformed frames */
+        continue;
       }
+      deliver(event);
     }
   });
 
   upstreamRes.on("end", () => {
+    settle();
+    if (!claimed) return;
     if (!finished) {
-      emit({}, toolCount > 0 ? "tool_calls" : "stop");
+      emitChunk(res, id, created, model, {}, toolCount > 0 ? "tool_calls" : "stop");
       res.write("data: [DONE]\n\n");
     }
     console.log(
-      `[${new Date().toISOString()}] <- stream done in ${Date.now() - started}ms text=${textChars} tools=${toolCount} ack=${ackMs === null ? "n/a" : ackMs + "ms"}`,
+      `[${new Date().toISOString()}] <- attempt ${attempt.index} won in ${Date.now() - startedAt}ms text=${textChars} tools=${toolCount} ack=${ackMs === null ? "n/a" : ackMs + "ms"}`,
     );
     res.end();
   });
 }
 
-/**
- * Hold a warm socket to the gateway so a turn does not pay DNS + TLS on top of
- * the gateway queue. This is a metadata GET: it spends no tokens.
- */
+function handleJsonAttempt(upstreamRes, attempt, claim, res, model, startedAt, settle) {
+  const parts = [];
+  upstreamRes.on("data", (c) => parts.push(c));
+  upstreamRes.on("end", () => {
+    settle();
+    if (!claim(attempt)) return;
+    let parsed;
+    try {
+      parsed = JSON.parse(Buffer.concat(parts).toString("utf-8"));
+    } catch (err) {
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({ error: { message: "Unparseable upstream response: " + err.message } }),
+      );
+      return;
+    }
+    let text = "";
+    const toolCalls = [];
+    for (const item of parsed.output || []) {
+      if (item.type === "message") {
+        for (const part of item.content || []) {
+          if (part.type === "output_text" && part.text) text += part.text;
+        }
+      } else if (item.type === "function_call") {
+        toolCalls.push({
+          id: item.call_id || item.id,
+          type: "function",
+          function: { name: item.name, arguments: item.arguments || "{}" },
+        });
+      }
+    }
+    const message = { role: "assistant", content: text || (toolCalls.length ? null : "") };
+    if (toolCalls.length) message.tool_calls = toolCalls;
+    const usage = parsed.usage || {};
+    console.log(
+      `[${new Date().toISOString()}] <- attempt ${attempt.index} won in ${Date.now() - startedAt}ms text=${text.length} tools=${toolCalls.length}`,
+    );
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "X-Proxy-Attempt": String(attempt.index),
+    });
+    res.end(
+      JSON.stringify({
+        id: parsed.id || completionId(),
+        object: "chat.completion",
+        created: parsed.created_at || Math.floor(Date.now() / 1000),
+        model,
+        choices: [
+          {
+            index: 0,
+            message,
+            finish_reason: toolCalls.length ? "tool_calls" : "stop",
+          },
+        ],
+        usage: {
+          prompt_tokens: usage.input_tokens ?? usage.prompt_tokens ?? 0,
+          completion_tokens: usage.output_tokens ?? usage.completion_tokens ?? 0,
+          total_tokens: usage.total_tokens ?? 0,
+        },
+      }),
+    );
+  });
+}
+
+/** Hold a warm socket so a turn does not pay DNS + TLS on top of the queue. */
 function warmUp() {
   const req = https.request(
     {
@@ -695,7 +764,9 @@ function warmUp() {
 }
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`agentrouter-proxy listening on ${PORT}`);
+  console.log(
+    `agentrouter-proxy listening on ${PORT} (hedge=${HEDGE_MAX}, delay=${HEDGE_DELAY_MS}ms)`,
+  );
   warmUp();
   setInterval(warmUp, 120000).unref();
 });

@@ -24,6 +24,7 @@ This proxy closes both gaps on your own machine or server, so the client never h
 | Tool schema mismatch | Normalises `{"type":"function","function":{…}}` tools into the flat Responses shape |
 | Streaming | Translates `response.output_text.delta` and `response.function_call_arguments.delta` into `chat.completion.chunk`, including `tool_calls` and `finish_reason` |
 | Slow first token | Keeps an HTTPS socket warm (`keepAlive` + periodic metadata warm-up) so a turn does not pay DNS/TLS again |
+| Unpredictable stalls | Hedges each request: a second (and third) attempt starts after a delay, first to answer wins, the rest are cancelled |
 | Cline's wrapped JSON | `POST /cline/v1/chat/completions` forwards to `api.cline.bot/api/v1` and unwraps the `{data, success}` envelope |
 
 Tool calls round-trip: `function_call` / `function_call_output` items are rebuilt from
@@ -85,14 +86,40 @@ stores no credentials.
 | `GET` | `/cline/v1/models` | Cline catalog |
 | `POST` | `/cline/v1/chat/completions` | Cline chat with envelope unwrapping |
 
+## Latency
+
+Two separate delays show up on this gateway, and only one of them is fixable here.
+
+1. **Connection setup** — measured before the keep-alive/warm-up work: the `response.created`
+   acknowledgement alone took 5.6–7.3 s on a fresh socket. A warm socket puts that at 0–280 ms.
+2. **Completion stalls** — the gateway acknowledges in milliseconds, then sometimes takes a very
+   long time to produce tokens. The same ten-token prompt measured 1.8 s, 22.9 s, 39.1 s and 77.2 s
+   in one back-to-back run, with the acknowledgement at 30–283 ms every time. The delay is
+   upstream generation, not admission control, not payload size, and not the proxy.
+
+`reasoning.effort` moves it a lot when the gateway is healthy (the same payload measured 46–52 s
+at `max` against 2–4 s at `low`), so the default is `low`. Raise it per request with the
+`reasoning_effort` field, or for the whole process with `AR_REASONING_EFFORT`.
+
+Because individual stalls are unpredictable, requests are **hedged**: a second attempt starts
+after `AR_HEDGE_DELAY_MS` and a third after the same gap again. The first attempt to emit text or
+a tool call wins; the rest are destroyed, and only the winner's bytes reach the client. This
+bounds the tail rather than the median — a run measured at 114 s without a second attempt landed
+at 21 s worst case with three. It cannot beat a gateway that is broadly stalled, and every extra
+attempt spends prompt tokens on requests that are cancelled, so set `AR_HEDGE=1` if you pay per
+token and prefer waiting to duplicate work.
+
 ## Environment
 
 | Variable | Default | Meaning |
 | :--- | :--- | :--- |
-| `AR_REASONING_EFFORT` | unset | Forces `reasoning.effort` (`low` / `medium` / `high` / `max`) when the client does not send one |
+| `AR_REASONING_EFFORT` | `low` | `reasoning.effort` used when the client sends none (`low` / `medium` / `high` / `max`) |
 | `AR_VERBOSITY` | unset | Forces `text.verbosity` |
+| `AR_HEDGE` | `2` | Concurrent attempts per request (1 disables hedging) |
+| `AR_HEDGE_DELAY_MS` | `8000` | Gap before each extra attempt |
+| `PORT` | `8789` | Listen port |
 
-The port is set by `PORT` near the top of `proxy.mjs`.
+`/health` reports the effective hedging settings.
 
 ## Limitations
 
