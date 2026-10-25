@@ -1,0 +1,21 @@
+[Unit]
+Description=AgentRouter proxy (Responses API + content-filter adapter)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/agentrouter-proxy
+ExecStart=/usr/bin/node /opt/agentrouter-proxy/proxy.mjs
+Restart=always
+RestartSec=3
+Environment=NODE_ENV=production
+# Optional: force a reasoning depth when the client sends none.
+#Environment=AR_REASONING_EFFORT=low
+
+# Run as a dedicated, unprivileged account.
+#User=agentrouter
+#Group=agentrouter
+
+[Install]
+WantedBy=multi-user.target
