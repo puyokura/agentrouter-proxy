@@ -47,6 +47,21 @@ const HEDGE_DELAY_MS = Math.max(
   Number(process.env.AR_HEDGE_DELAY_MS ?? 8000) || 0,
 );
 
+/**
+ * Hedging duplicates the prompt, and an aborted attempt still bills its input
+ * tokens. Restrict it to routes where that costs nothing (the unlimited free
+ * model) unless the operator opts others in via AR_HEDGE_MODELS.
+ */
+const HEDGE_MODELS = (process.env.AR_HEDGE_MODELS ?? "gpt-6.1-sol")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+function hedgeFor(model) {
+  const id = String(model || "");
+  return HEDGE_MODELS.some((m) => m === "*" || id === m || id.startsWith(m)) ? HEDGE_MAX : 1;
+}
+
 /** Reasoning depth dominates time-to-first-token; low keeps turns snappy. */
 const DEFAULT_EFFORT = process.env.AR_REASONING_EFFORT || "low";
 
@@ -211,7 +226,14 @@ const server = http.createServer((req, res) => {
   }
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", hedge: HEDGE_MAX, hedgeDelayMs: HEDGE_DELAY_MS }));
+    res.end(
+      JSON.stringify({
+        status: "ok",
+        hedge: HEDGE_MAX,
+        hedgeDelayMs: HEDGE_DELAY_MS,
+        hedgeModels: HEDGE_MODELS,
+      }),
+    );
     return;
   }
   if (req.method === "GET" && (req.url === "/v1/models" || req.url === "/models")) {
@@ -413,9 +435,10 @@ function forward(req, res, body) {
   const model = body.model || "";
   const payloadBuffer = Buffer.from(JSON.stringify(payload), "utf-8");
   const startedAt = Date.now();
+  const hedgeMax = hedgeFor(model);
 
   console.log(
-    `[${new Date().toISOString()}] -> ${model} stream=${stream} msgs=${messageCount} tools=${tools} effort=${payload.reasoning.effort} hedge=${HEDGE_MAX}`,
+    `[${new Date().toISOString()}] -> ${model} stream=${stream} msgs=${messageCount} tools=${tools} effort=${payload.reasoning.effort} hedge=${hedgeMax}`,
   );
 
   const state = {
@@ -425,7 +448,16 @@ function forward(req, res, body) {
     failures: [],
     active: 0,
     timer: null,
+    emptyRetries: 0,
   };
+
+  /**
+   * An empty completion (HTTP 200, no output events) is a transport failure,
+   * not an answer. Allow exactly one extra attempt for it even when hedging is
+   * off for this route, so a paid model is not left with a bare 502.
+   */
+  const attemptLimit = () =>
+    Math.min(4, hedgeMax + (state.emptyRetries > 0 ? 1 : 0));
 
   const finishError = () => {
     if (state.settled) return;
@@ -449,7 +481,7 @@ function forward(req, res, body) {
 
   const schedule = () => {
     if (state.settled) return;
-    if (state.attempts.length >= HEDGE_MAX) return;
+    if (state.attempts.length >= attemptLimit()) return;
     state.timer = setTimeout(() => {
       if (state.settled) return;
       launch();
@@ -463,11 +495,15 @@ function forward(req, res, body) {
     state.attempts.push(attempt);
     state.active += 1;
     let done = false;
-    const settleAttempt = () => {
+    const settleAttempt = (reason) => {
       if (done) return;
       done = true;
       state.active -= 1;
-      if (!state.settled && state.attempts.length >= HEDGE_MAX && state.active === 0) {
+      if (reason === "empty") {
+        state.failures.push("empty completion (no output events)");
+        state.emptyRetries += 1;
+      }
+      if (!state.settled && state.attempts.length >= attemptLimit() && state.active === 0) {
         finishError();
       }
     };
@@ -670,8 +706,10 @@ function handleStreamAttempt(upstreamRes, attempt, claim, res, model, startedAt,
   });
 
   upstreamRes.on("end", () => {
-    settle();
-    if (!claimed) return;
+    if (!claimed) {
+      settle("empty");
+      return;
+    }
     if (!finished) {
       emitChunk(res, id, created, model, {}, toolCount > 0 ? "tool_calls" : "stop");
       res.write("data: [DONE]\n\n");
@@ -687,9 +725,26 @@ function handleJsonAttempt(upstreamRes, attempt, claim, res, model, startedAt, s
   const parts = [];
   upstreamRes.on("data", (c) => parts.push(c));
   upstreamRes.on("end", () => {
+    let parsed;
+    try {
+      parsed = JSON.parse(Buffer.concat(parts).toString("utf-8"));
+    } catch {
+      parsed = undefined;
+    }
+    const produced =
+      parsed &&
+      (parsed.output || []).some(
+        (item) =>
+          item.type === "function_call" ||
+          (item.type === "message" &&
+            (item.content || []).some((part) => part.type === "output_text" && part.text)),
+      );
+    if (!produced) {
+      settle("empty");
+      return;
+    }
     settle();
     if (!claim(attempt)) return;
-    let parsed;
     try {
       parsed = JSON.parse(Buffer.concat(parts).toString("utf-8"));
     } catch (err) {
