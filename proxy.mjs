@@ -68,6 +68,7 @@ const DEFAULT_EFFORT = process.env.AR_REASONING_EFFORT || "low";
 const CJK_RE =
   /[\u1100-\u11ff\u2e80-\u2fdf\u3040-\u30ff\u3130-\u318f\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]/u;
 
+const OLD_MESSAGE_LIMIT = Number(process.env.AR_OLD_MESSAGE_LIMIT ?? 1200) || 1200;
 const INLINE_TEXT_LIMIT = 400;
 const INLINE_TOOL_LIMIT = 600;
 
@@ -138,9 +139,25 @@ function toolCallsOf(message) {
 /** Plain-text transcript; the authoritative copy of the conversation. */
 function renderTranscript(messages) {
   const lines = [];
+  const seen = new Map();
   let index = 0;
   for (const m of messages) {
     index += 1;
+    let raw = stripControl(flattenContent(m.content)).trim();
+    if (raw.length > 0) {
+      const first = seen.get(raw);
+      if (first !== undefined) {
+        lines.push(`[${index}] ${m.role}: [identical to message ${first}]`);
+        continue;
+      }
+      seen.set(raw, index);
+    }
+    // Older turns are context, not instructions. Keeping their full text
+    // multiplies prefill — and prefill is what this gateway charges in latency.
+    const isRecent = index > messages.length - 2;
+    if (!isRecent && raw.length > OLD_MESSAGE_LIMIT) {
+      raw = `${raw.slice(0, OLD_MESSAGE_LIMIT)}\n…[truncated ${raw.length - OLD_MESSAGE_LIMIT} chars]`;
+    }
     const role = m && m.role ? m.role : "user";
     const calls = toolCallsOf(m);
     if (role === "tool") {
@@ -160,8 +177,7 @@ function renderTranscript(messages) {
       }
       continue;
     }
-    const text = stripControl(flattenContent(m.content)).trim();
-    if (text) lines.push(`[${index}] ${role}: ${text}`);
+    if (raw) lines.push(`[${index}] ${role}: ${raw}`);
   }
   return lines.join("\n\n");
 }
@@ -383,12 +399,19 @@ function completionId() {
 
 function buildUpstreamPayload(body) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
-  const systems = [];
+  // DSH re-sends the whole system prompt every turn; only the newest one
+  // describes the current turn. Keeping the rest multiplies the prompt.
+  let latestSystem = "";
   const conversation = [];
   for (const m of messages) {
-    if (m && m.role === "system") systems.push(flattenContent(m.content));
-    else conversation.push(m);
+    if (m && m.role === "system") {
+      const text = flattenContent(m.content);
+      if (text.trim().length > 0) latestSystem = text;
+    } else {
+      conversation.push(m);
+    }
   }
+  const systems = latestSystem ? [latestSystem] : [];
 
   const transcript = renderTranscript(conversation);
   const instructions = [
